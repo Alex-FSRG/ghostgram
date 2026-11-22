@@ -1,0 +1,46 @@
+
+name: Ghostgram VPN Core
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "Ghostgram/Features/Vless/Core/**"
+      - ".github/workflows/build-vpn.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-vpn:
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Ghostgram
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          go version
+
+      - name: Build Xray Core for iOS
+        run: |
+          chmod +x Ghostgram/Features/Vless/Core/build-core.sh
+          Ghostgram/Features/Vless/Core/build-core.sh
+
+      - name: Upload VPN Core
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ghostgram-VPN-Core-iOS
+          path: Ghostgram/Features/Vless/Core/build/ios_arm64/GGXrayCore.framework.zip
+          if-no-files-found: error
+          retention-days: 7
