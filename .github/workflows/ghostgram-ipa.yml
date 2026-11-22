@@ -1,104 +1,138 @@
+# Builds an unsigned (self-signed) Ghostgram.ipa from this repository's own source, for re-signing on
+# the phone with your own certificate (Feather, KSign, zsign...).
+#
+# Before the first run, add two repository secrets (Settings -> Secrets and variables -> Actions):
+#   TG_API_ID    your api_id from https://my.telegram.org
+#   TG_API_HASH  your api_hash from https://my.telegram.org
+# Then: Actions -> "Build Ghostgram IPA" -> Run workflow. The IPA is attached to the run as an artifact.
+#
+# The app is built with bundle id ph.telegra.Telegraph (the only one the fake profiles cover).
+# Change the bundle id when you re-sign it, or it will clash with the official Telegram app.
 
 name: Build Ghostgram IPA
 
 on:
   workflow_dispatch:
+    inputs:
+      build_number:
+        description: Build number (any integer)
+        required: false
+        default: '1'
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build iPhone IPA
-    runs-on: macos-15
-    timeout-minutes: 180
+    runs-on: xcode-27
+    timeout-minutes: 360
 
     steps:
-      - name: Checkout Ghostgram
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 0
+      - name: Check the secrets
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        run: |
+          if [ -z "$TG_API_ID" ] || [ -z "$TG_API_HASH" ]; then
+            echo "::error::Add the TG_API_ID and TG_API_HASH repository secrets first (values from my.telegram.org)."
+            exit 1
+          fi
+          case "$TG_API_ID" in *[!0-9]*) echo "::error::TG_API_ID must be a number."; exit 1 ;; esac
+
+      - name: Free disk space
+        run: |
+          df -h /
+          # Keep only the newest release Xcode 27; the others and the Android SDK take tens of GB.
+          KEEP="$(ls -d /Applications/Xcode_27*.app 2>/dev/null | grep -vi beta | sort -V | tail -1)"
+          [ -n "$KEEP" ] || KEEP="$(ls -d /Applications/Xcode_27*.app | sort -V | tail -1)"
+          KEEP="$(cd "$KEEP" && pwd -P)"
+          echo "XCODE_APP=$KEEP" >> "$GITHUB_ENV"
+          for x in /Applications/Xcode_*.app; do
+            [ -L "$x" ] && continue
+            [ "$(cd "$x" && pwd -P)" = "$KEEP" ] && continue
+            sudo rm -rf "$x" || true
+          done
+          sudo rm -rf "${ANDROID_HOME:-/nonexistent}" ~/Library/Android /usr/local/share/dotnet || true
+          df -h /
 
       - name: Select Xcode
         run: |
-          xcode-select -p
+          # Some third-party builds (dav1d's meson cross files) hardcode /Applications/Xcode.app.
+          # It is a symlink on the runner and may point at an Xcode removed above, so point it here.
+          if [ -L /Applications/Xcode.app ] || [ ! -e /Applications/Xcode.app ]; then
+            sudo rm -f /Applications/Xcode.app
+            sudo ln -s "$XCODE_APP" /Applications/Xcode.app
+          fi
+          ls -ld /Applications/Xcode.app
+          ls -d /Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
           xcodebuild -version
-          python3 --version
 
-      - name: Install signing certificate
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Write the build configuration
         env:
-          P12_BASE64: ${{ secrets.P12_BASE64 }}
-          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
         run: |
-          set -euo pipefail
+          python3 - <<'EOF'
+          import json, os
+          config = {
+              "bundle_id": "ph.telegra.Telegraph",
+              "api_id": os.environ["TG_API_ID"],
+              "api_hash": os.environ["TG_API_HASH"],
+              "team_id": "C67CF9S4VU",
+              "app_center_id": "0",
+              "is_internal_build": "false",
+              "is_appstore_build": "false",
+              "appstore_id": "0",
+              "app_specific_url_scheme": "tg",
+              "premium_iap_product_id": "",
+              "enable_siri": False,
+              "enable_icloud": False,
+          }
+          with open("build-system/ghostgram-configuration.json", "w") as f:
+              json.dump(config, f, indent=2)
+          EOF
 
-          KEYCHAIN="$RUNNER_TEMP/ghostgram.keychain-db"
-          CERT="$RUNNER_TEMP/certificate.p12"
-
-          echo "$P12_BASE64" | base64 --decode > "$CERT"
-
-          security create-keychain \
-            -p "$P12_PASSWORD" "$KEYCHAIN"
-
-          security set-keychain-settings \
-            -lut 21600 "$KEYCHAIN"
-
-          security unlock-keychain \
-            -p "$P12_PASSWORD" "$KEYCHAIN"
-
-          security import "$CERT" \
-            -k "$KEYCHAIN" \
-            -P "$P12_PASSWORD" \
-            -T /usr/bin/codesign
-
-          security set-key-partition-list \
-            -S apple-tool:,apple: \
-            -s -k "$P12_PASSWORD" "$KEYCHAIN"
-
-          security list-keychains \
-            -d user -s "$KEYCHAIN"
-
-      - name: Install provisioning profile
-        env:
-          PROFILE_BASE64: ${{ secrets.MOBILEPROVISION_BASE64 }}
+      - name: Refresh the fake signing profiles
         run: |
-          set -euo pipefail
+          rm -rf build-system/gg-ci-codesigning
+          cp -R build-system/fake-codesigning build-system/gg-ci-codesigning
+          OPENSSL="$(brew --prefix openssl@3 2>/dev/null)/bin/openssl"
+          [ -x "$OPENSSL" ] || OPENSSL=openssl
+          python3 .github/scripts/refresh-fake-profiles.py build-system/gg-ci-codesigning "$OPENSSL"
+          python3 build-system/Make/ImportCertificates.py --path build-system/gg-ci-codesigning/certs
 
-          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+      - name: Pin Xcode for Bazel and apply the Ghostgram patches
+        run: GG_PATCHES_ONLY=1 build-system/GGBuild.sh
 
-          PROFILE="$RUNNER_TEMP/profile.mobileprovision"
-          echo "$PROFILE_BASE64" | base64 --decode > "$PROFILE"
-
-          security cms -D -i "$PROFILE" \
-            > "$RUNNER_TEMP/profile.plist"
-
-          UUID=$(/usr/libexec/PlistBuddy \
-            -c 'Print UUID' "$RUNNER_TEMP/profile.plist")
-
-          cp "$PROFILE" \
-            "$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision"
-
-      - name: Check build configuration
+      - name: Build
         run: |
-          test -f build-system/appstore-configuration.json
-          test -f build-system/Make/Make.py
-          test -d build-system/local-codesigning
-
-      - name: Build Ghostgram
-        run: |
-          python3 build-system/Make/Make.py \
-            --cacheDir="$HOME/telegram-bazel-cache" \
+          mkdir -p build-output/ipa
+          python3 -u build-system/Make/Make.py --overrideXcodeVersion \
+            --cacheDir "$HOME/telegram-bazel-cache" \
             build \
-            --configurationPath=build-system/appstore-configuration.json \
-            --codesigningInformationPath=build-system/local-codesigning \
-            --buildNumber="${GITHUB_RUN_NUMBER}" \
-            --configuration=release_arm64
+            --configurationPath build-system/ghostgram-configuration.json \
+            --codesigningInformationPath build-system/gg-ci-codesigning \
+            --configuration=release_arm64 \
+            --buildNumber="${{ inputs.build_number }}" \
+            --outputBuildArtifactsPath build-output/ipa
+          mv build-output/ipa/Telegram.ipa build-output/ipa/Ghostgram.ipa
+          ls -lh build-output/ipa
+          shasum -a 256 build-output/ipa/Ghostgram.ipa
 
-      - name: Upload IPA
+      - name: Upload the IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Ghostgram-iPhone-IPA
-          path: build-output/**/*.ipa
-          if-no-files-found: error
-          retention-days: 7
+          name: Ghostgram-ipa
+          path: build-output/ipa/Ghostgram.ipa
+          retention-days: 3
+          compression-level: 0
+
+      - name: Disk usage at the end
+        if: always()
+        run: df -h /
